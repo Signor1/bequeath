@@ -22,7 +22,7 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
     bytes32 public constant ORACLE_ROLE = keccak256("ORACLE_ROLE");
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
 
-    // ================================ Structs =============================================
+    // ============ Structs ================
 
     // Enhanced Will structure
     struct Will {
@@ -62,7 +62,9 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
         uint256 executorConsensusCount;
     }
 
+    // ============== Enums ============
     enum AssetType {
+        None,
         ETH,
         ERC20,
         ERC721,
@@ -70,6 +72,7 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
     }
 
     enum WillStatus {
+        None,
         Active,
         Suspended,
         Executed,
@@ -91,9 +94,11 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
     mapping(address => InheritanceProcess) public inheritanceProcesses;
     mapping(address => mapping(address => bool)) public executorConsensus;
 
+    // Death oracle and push notification interfaces
     IDeathOracle public deathOracle;
     IPushNotification public pushNotification;
 
+    // Constants
     uint256 public constant MIN_MORATORIUM_PERIOD = 7 days;
     uint256 public constant MAX_MORATORIUM_PERIOD = 365 days;
     uint256 public constant CHALLENGE_PERIOD = 3 days;
@@ -130,6 +135,7 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
     );
     event NotificationSent(address indexed recipient, string title);
 
+    // Modifiers
     modifier onlyOwnerOrExecutor(address owner) {
         require(
             owner == msg.sender || isExecutor(owner, msg.sender),
@@ -152,7 +158,12 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
     }
 
     /**
-     * @dev Create or update a comprehensive will
+     * @dev Create or update a will with multiple executors and beneficiaries
+     * @param _executors Array of executor addresses
+     * @param _beneficiaries Array of beneficiary structs
+     * @param _moratoriumPeriod Moratorium period in seconds
+     * @param _identityHash Hash of the owner's identity for oracle verification
+     * @param _requiresOracleVerification Whether oracle verification is required
      */
     function createWill(
         address[] calldata _executors,
@@ -232,7 +243,12 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
     }
 
     /**
-     * @dev Register assets to be included in inheritance
+     * @dev Register an asset for inheritance
+     * @param _assetType Type of the asset (ETH, ERC20, ERC721, ERC1155)
+     * @param _contractAddress Address of the asset contract (if applicable)
+     * @param _tokenId Token ID for NFTs (0 for ETH/ERC20)
+     * @param _amount Amount of the asset (0 for NFTs)
+     * @param _additionalData Additional data for the asset (if needed)
      */
     function registerAsset(
         AssetType _assetType,
@@ -256,7 +272,8 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
     }
 
     /**
-     * @dev Announce inheritance process with enhanced security
+     * @dev Announce inheritance process
+     * @param owner Address of the will owner
      */
     function announceInheritance(
         address owner
@@ -301,7 +318,8 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
     }
 
     /**
-     * @dev Provide executor consensus for inheritance
+     * @dev Provide consensus for inheritance process
+     * @param owner Address of the will owner
      */
     function provideConsensus(address owner) external onlyValidWill(owner) {
         require(
@@ -323,6 +341,8 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
 
     /**
      * @dev Challenge inheritance process
+     * @param owner Address of the will owner
+     * @param reason Reason for challenging
      */
     function challengeInheritance(
         address owner,
@@ -349,7 +369,8 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
     }
 
     /**
-     * @dev Execute inheritance after all conditions are met
+     * @dev Execute inheritance process after moratorium and challenge period
+     * @param owner Address of the will owner
      */
     function executeInheritance(
         address owner
@@ -391,7 +412,8 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
     }
 
     /**
-     * @dev Internal function to transfer assets to beneficiaries
+     * @dev Transfer assets to beneficiaries
+     * @param owner Address of the will owner
      */
     function _transferAssets(address owner) internal {
         Will storage will = wills[owner];
@@ -441,7 +463,8 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
     }
 
     /**
-     * @dev Emergency functions
+     * @dev Emergency pause and unpause functions
+     * @notice Allows admin to pause or unpause the contract
      */
     function emergencyPause() external onlyRole(ADMIN_ROLE) {
         _pause();
@@ -451,6 +474,10 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
         _unpause();
     }
 
+    /**
+     * @dev Revoke an existing will
+     * @notice Can only be called by the owner of the will
+     */
     function revokeWill() external {
         require(wills[msg.sender].owner == msg.sender, "No will exists");
         require(
@@ -462,7 +489,7 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
         _notifyExecutors(msg.sender, "Will Revoked");
     }
 
-    // View functions
+    // ====== View functions =======
     function getWill(address owner) external view returns (Will memory) {
         return wills[owner];
     }
@@ -477,6 +504,13 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
         return inheritanceProcesses[owner];
     }
 
+    // ======= Helper Functions =========
+    /**
+     * @dev Check if an address is an executor of a will
+     * @param owner Address of the will owner
+     * @param executor Address to check
+     * @return bool True if the address is an executor, false otherwise
+     */
     function isExecutor(
         address owner,
         address executor
@@ -489,6 +523,11 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
     }
 
     // Internal notification functions
+    /**
+     * @dev Notify executors and beneficiaries via push notifications
+     * @param owner Address of the will owner
+     * @param message Notification message
+     */
     function _notifyExecutors(address owner, string memory message) internal {
         Will storage will = wills[owner];
         for (uint i = 0; i < will.executors.length; i++) {
@@ -506,6 +545,11 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
         }
     }
 
+    /**
+     * @dev Notify beneficiaries via push notifications
+     * @param owner Address of the will owner
+     * @param message Notification message
+     */
     function _notifyBeneficiaries(
         address owner,
         string memory message
