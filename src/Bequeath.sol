@@ -9,14 +9,13 @@ import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 import "@openzeppelin/contracts/interfaces/IERC165.sol";
 import {IDeathOracle} from "./interface/IDeathOracle.sol";
-import {IPushNotification} from "./interface/IPushNotification.sol";
+import {IPUSHCommInterface} from "./interface/IPushNotification.sol";
 
 /**
  * @title Enhanced Bequeathable Asset Registry
  * @dev Comprehensive inheritance system supporting multiple asset types and enhanced security
  * @author Enhanced from ERC-7878 proposal - https://eips.ethereum.org/EIPS/eip-7878
  */
-
 contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
     // Roles
     bytes32 public constant ORACLE_ROLE = keccak256("ORACLE_ROLE");
@@ -96,7 +95,7 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
 
     // Death oracle and push notification interfaces
     IDeathOracle public deathOracle;
-    IPushNotification public pushNotification;
+    IPUSHCommInterface public pushNotification;
 
     // Constants
     uint256 public constant MIN_MORATORIUM_PERIOD = 7 days;
@@ -105,42 +104,18 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
     uint256 public constant MIN_EXECUTOR_CONSENSUS = 2; // Minimum executors needed for consensus
 
     // Events
-    event WillCreated(
-        address indexed owner,
-        uint256 executorCount,
-        uint256 beneficiaryCount
-    );
+    event WillCreated(address indexed owner, uint256 executorCount, uint256 beneficiaryCount);
     event WillUpdated(address indexed owner, uint256 timestamp);
-    event AssetRegistered(
-        address indexed owner,
-        AssetType assetType,
-        address contractAddress
-    );
-    event InheritanceAnnounced(
-        address indexed owner,
-        address indexed initiator,
-        uint256 challengeDeadline
-    );
-    event InheritanceChallenged(
-        address indexed owner,
-        address indexed challenger
-    );
-    event InheritanceExecuted(
-        address indexed owner,
-        uint256 totalBeneficiaries
-    );
-    event OracleVerificationRequested(
-        address indexed owner,
-        bytes32 identityHash
-    );
+    event AssetRegistered(address indexed owner, AssetType assetType, address contractAddress);
+    event InheritanceAnnounced(address indexed owner, address indexed initiator, uint256 challengeDeadline);
+    event InheritanceChallenged(address indexed owner, address indexed challenger);
+    event InheritanceExecuted(address indexed owner, uint256 totalBeneficiaries);
+    event OracleVerificationRequested(address indexed owner, bytes32 identityHash);
     event NotificationSent(address indexed recipient, string title);
 
     // Modifiers
     modifier onlyOwnerOrExecutor(address owner) {
-        require(
-            owner == msg.sender || isExecutor(owner, msg.sender),
-            "Only owner or executor"
-        );
+        require(owner == msg.sender || isExecutor(owner, msg.sender), "Only owner or executor");
         _;
     }
 
@@ -154,7 +129,7 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(ADMIN_ROLE, msg.sender);
         deathOracle = IDeathOracle(_deathOracle);
-        pushNotification = IPushNotification(_pushNotification);
+        pushNotification = IPUSHCommInterface(_pushNotification);
     }
 
     /**
@@ -175,36 +150,23 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
         require(_executors.length >= 2, "Minimum 2 executors required");
         require(_executors.length <= 10, "Maximum 10 executors allowed");
         require(_beneficiaries.length > 0, "At least one beneficiary required");
+        require(_beneficiaries.length <= 20, "Maximum 20 beneficiaries allowed");
         require(
-            _beneficiaries.length <= 20,
-            "Maximum 20 beneficiaries allowed"
-        );
-        require(
-            _moratoriumPeriod >= MIN_MORATORIUM_PERIOD &&
-                _moratoriumPeriod <= MAX_MORATORIUM_PERIOD,
+            _moratoriumPeriod >= MIN_MORATORIUM_PERIOD && _moratoriumPeriod <= MAX_MORATORIUM_PERIOD,
             "Invalid moratorium period"
         );
 
         // Validate beneficiary percentages sum to 100%
         uint256 totalPercentage = 0;
-        for (uint i = 0; i < _beneficiaries.length; i++) {
-            require(
-                _beneficiaries[i].beneficiaryAddress != address(0),
-                "Invalid beneficiary address"
-            );
-            require(
-                _beneficiaries[i].percentage > 0,
-                "Beneficiary percentage must be > 0"
-            );
+        for (uint256 i = 0; i < _beneficiaries.length; i++) {
+            require(_beneficiaries[i].beneficiaryAddress != address(0), "Invalid beneficiary address");
+            require(_beneficiaries[i].percentage > 0, "Beneficiary percentage must be > 0");
             totalPercentage += _beneficiaries[i].percentage;
         }
-        require(
-            totalPercentage == 10000,
-            "Beneficiary percentages must sum to 100%"
-        );
+        require(totalPercentage == 10000, "Beneficiary percentages must sum to 100%");
 
         // Validate executors
-        for (uint i = 0; i < _executors.length; i++) {
+        for (uint256 i = 0; i < _executors.length; i++) {
             require(_executors[i] != address(0), "Invalid executor address");
             require(_executors[i] != msg.sender, "Owner cannot be executor");
         }
@@ -215,7 +177,7 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
         will.owner = msg.sender;
         will.executors = _executors;
         delete will.beneficiaries; // Clear existing beneficiaries
-        for (uint i = 0; i < _beneficiaries.length; i++) {
+        for (uint256 i = 0; i < _beneficiaries.length; i++) {
             will.beneficiaries.push(_beneficiaries[i]);
         }
         will.moratoriumPeriod = _moratoriumPeriod;
@@ -226,20 +188,13 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
 
         if (!isUpdate) {
             will.createdAt = block.timestamp;
-            emit WillCreated(
-                msg.sender,
-                _executors.length,
-                _beneficiaries.length
-            );
+            emit WillCreated(msg.sender, _executors.length, _beneficiaries.length);
         } else {
             emit WillUpdated(msg.sender, block.timestamp);
         }
 
         // Send notifications to executors
-        _notifyExecutors(
-            msg.sender,
-            isUpdate ? "Will Updated" : "Will Created"
-        );
+        _notifyExecutors(msg.sender, isUpdate ? "Will Updated" : "Will Created");
     }
 
     /**
@@ -275,20 +230,15 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
      * @dev Announce inheritance process
      * @param owner Address of the will owner
      */
-    function announceInheritance(
-        address owner
-    ) external whenNotPaused onlyValidWill(owner) nonReentrant {
+    function announceInheritance(address owner) external whenNotPaused onlyValidWill(owner) nonReentrant {
         require(isExecutor(owner, msg.sender), "Only executor can announce");
-        require(
-            inheritanceProcesses[owner].status == ProcessStatus.NotStarted,
-            "Process already started"
-        );
+        require(inheritanceProcesses[owner].status == ProcessStatus.NotStarted, "Process already started");
 
         Will storage will = wills[owner];
 
         // If oracle verification required, check death status
         if (will.requiresOracleVerification) {
-            (bool verified, ) = deathOracle.isPersonDeceased(will.identityHash);
+            (bool verified,) = deathOracle.isPersonDeceased(will.identityHash);
             if (!verified) {
                 // Request verification if not already verified
                 deathOracle.requestDeathVerification(will.identityHash, "");
@@ -304,7 +254,7 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
         process.status = ProcessStatus.Announced;
 
         if (will.requiresOracleVerification) {
-            (bool verified, ) = deathOracle.isPersonDeceased(will.identityHash);
+            (bool verified,) = deathOracle.isPersonDeceased(will.identityHash);
             process.oracleVerified = verified;
         } else {
             process.oracleVerified = true; // Skip oracle for non-oracle wills
@@ -322,18 +272,9 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
      * @param owner Address of the will owner
      */
     function provideConsensus(address owner) external onlyValidWill(owner) {
-        require(
-            isExecutor(owner, msg.sender),
-            "Only executor can provide consensus"
-        );
-        require(
-            inheritanceProcesses[owner].status == ProcessStatus.Announced,
-            "Invalid process status"
-        );
-        require(
-            !executorConsensus[owner][msg.sender],
-            "Consensus already provided"
-        );
+        require(isExecutor(owner, msg.sender), "Only executor can provide consensus");
+        require(inheritanceProcesses[owner].status == ProcessStatus.Announced, "Invalid process status");
+        require(!executorConsensus[owner][msg.sender], "Consensus already provided");
 
         executorConsensus[owner][msg.sender] = true;
         inheritanceProcesses[owner].executorConsensusCount++;
@@ -344,58 +285,32 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
      * @param owner Address of the will owner
      * @param reason Reason for challenging
      */
-    function challengeInheritance(
-        address owner,
-        string calldata reason
-    ) external onlyOwnerOrExecutor(owner) {
+    function challengeInheritance(address owner, string calldata reason) external onlyOwnerOrExecutor(owner) {
         InheritanceProcess storage process = inheritanceProcesses[owner];
-        require(
-            process.status == ProcessStatus.Announced,
-            "Cannot challenge at this stage"
-        );
-        require(
-            block.timestamp <= process.challengeEndTime,
-            "Challenge period expired"
-        );
+        require(process.status == ProcessStatus.Announced, "Cannot challenge at this stage");
+        require(block.timestamp <= process.challengeEndTime, "Challenge period expired");
 
         process.status = ProcessStatus.Challenged;
         process.challengers.push(msg.sender);
 
         emit InheritanceChallenged(owner, msg.sender);
-        _notifyExecutors(
-            owner,
-            string(abi.encodePacked("Inheritance Challenged: ", reason))
-        );
+        _notifyExecutors(owner, string(abi.encodePacked("Inheritance Challenged: ", reason)));
     }
 
     /**
      * @dev Execute inheritance process after moratorium and challenge period
      * @param owner Address of the will owner
      */
-    function executeInheritance(
-        address owner
-    ) external whenNotPaused onlyValidWill(owner) nonReentrant {
+    function executeInheritance(address owner) external whenNotPaused onlyValidWill(owner) nonReentrant {
         require(isExecutor(owner, msg.sender), "Only executor can execute");
 
         InheritanceProcess storage process = inheritanceProcesses[owner];
         Will storage will = wills[owner];
 
-        require(
-            process.status == ProcessStatus.Announced,
-            "Invalid process status"
-        );
-        require(
-            block.timestamp > process.challengeEndTime,
-            "Challenge period not expired"
-        );
-        require(
-            block.timestamp >= process.startTime + will.moratoriumPeriod,
-            "Moratorium period not met"
-        );
-        require(
-            process.executorConsensusCount >= MIN_EXECUTOR_CONSENSUS,
-            "Insufficient executor consensus"
-        );
+        require(process.status == ProcessStatus.Announced, "Invalid process status");
+        require(block.timestamp > process.challengeEndTime, "Challenge period not expired");
+        require(block.timestamp >= process.startTime + will.moratoriumPeriod, "Moratorium period not met");
+        require(process.executorConsensusCount >= MIN_EXECUTOR_CONSENSUS, "Insufficient executor consensus");
 
         if (will.requiresOracleVerification) {
             require(process.oracleVerified, "Oracle verification required");
@@ -419,43 +334,30 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
         Will storage will = wills[owner];
         Asset[] storage assets = registeredAssets[owner];
 
-        for (uint i = 0; i < assets.length; i++) {
+        for (uint256 i = 0; i < assets.length; i++) {
             Asset storage asset = assets[i];
 
-            for (uint j = 0; j < will.beneficiaries.length; j++) {
+            for (uint256 j = 0; j < will.beneficiaries.length; j++) {
                 Beneficiary storage beneficiary = will.beneficiaries[j];
-                uint256 transferAmount = (asset.amount *
-                    beneficiary.percentage) / 10000;
+                uint256 transferAmount = (asset.amount * beneficiary.percentage) / 10000;
 
                 if (transferAmount == 0) continue;
 
                 if (asset.assetType == AssetType.ETH) {
-                    payable(beneficiary.beneficiaryAddress).transfer(
-                        transferAmount
-                    );
+                    payable(beneficiary.beneficiaryAddress).transfer(transferAmount);
                 } else if (asset.assetType == AssetType.ERC20) {
-                    IERC20(asset.contractAddress).transferFrom(
-                        owner,
-                        beneficiary.beneficiaryAddress,
-                        transferAmount
-                    );
+                    IERC20(asset.contractAddress).transferFrom(owner, beneficiary.beneficiaryAddress, transferAmount);
                 } else if (asset.assetType == AssetType.ERC721) {
                     // For NFTs, transfer to beneficiary with highest percentage for this asset
                     if (j == 0) {
                         // Transfer to first beneficiary for simplicity
                         IERC721(asset.contractAddress).transferFrom(
-                            owner,
-                            beneficiary.beneficiaryAddress,
-                            asset.tokenId
+                            owner, beneficiary.beneficiaryAddress, asset.tokenId
                         );
                     }
                 } else if (asset.assetType == AssetType.ERC1155) {
                     IERC1155(asset.contractAddress).safeTransferFrom(
-                        owner,
-                        beneficiary.beneficiaryAddress,
-                        asset.tokenId,
-                        transferAmount,
-                        ""
+                        owner, beneficiary.beneficiaryAddress, asset.tokenId, transferAmount, ""
                     );
                 }
             }
@@ -481,8 +383,7 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
     function revokeWill() external {
         require(wills[msg.sender].owner == msg.sender, "No will exists");
         require(
-            inheritanceProcesses[msg.sender].status == ProcessStatus.NotStarted,
-            "Cannot revoke during active process"
+            inheritanceProcesses[msg.sender].status == ProcessStatus.NotStarted, "Cannot revoke during active process"
         );
 
         wills[msg.sender].status = WillStatus.Revoked;
@@ -498,9 +399,7 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
         return registeredAssets[owner];
     }
 
-    function getInheritanceProcess(
-        address owner
-    ) external view returns (InheritanceProcess memory) {
+    function getInheritanceProcess(address owner) external view returns (InheritanceProcess memory) {
         return inheritanceProcesses[owner];
     }
 
@@ -511,12 +410,9 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
      * @param executor Address to check
      * @return bool True if the address is an executor, false otherwise
      */
-    function isExecutor(
-        address owner,
-        address executor
-    ) public view returns (bool) {
+    function isExecutor(address owner, address executor) public view returns (bool) {
         Will storage will = wills[owner];
-        for (uint i = 0; i < will.executors.length; i++) {
+        for (uint256 i = 0; i < will.executors.length; i++) {
             if (will.executors[i] == executor) return true;
         }
         return false;
@@ -530,14 +426,25 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
      */
     function _notifyExecutors(address owner, string memory message) internal {
         Will storage will = wills[owner];
-        for (uint i = 0; i < will.executors.length; i++) {
-            try
-                pushNotification.sendNotification(
-                    will.executors[i],
-                    "Bequeathable Alert",
-                    message
+        for (uint256 i = 0; i < will.executors.length; i++) {
+            try pushNotification.sendNotification(
+                address(0x123), // Channel address, replace with actual channel address
+                will.executors[i], // Recipient address
+                bytes(
+                    string(
+                        // We are passing identity here: https://comms.push.org/docs/notifications/notification-standards/notification-standards-advance/#notification-identity
+                        abi.encodePacked(
+                            "0", // this represents minimal identity,
+                            "+", // segregator
+                            "3", // define notification type: (1, 3 or 4) = (Broadcast, targeted or subset)
+                            "+", // segregator
+                            "Inheritance Update", // this is notification title
+                            "+", // segregator
+                            "Body" // notification body
+                        )
+                    )
                 )
-            {
+            ) {
                 emit NotificationSent(will.executors[i], message);
             } catch {
                 // Continue if notification fails
@@ -550,23 +457,28 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
      * @param owner Address of the will owner
      * @param message Notification message
      */
-    function _notifyBeneficiaries(
-        address owner,
-        string memory message
-    ) internal {
+    function _notifyBeneficiaries(address owner, string memory message) internal {
         Will storage will = wills[owner];
-        for (uint i = 0; i < will.beneficiaries.length; i++) {
-            try
-                pushNotification.sendNotification(
-                    will.beneficiaries[i].beneficiaryAddress,
-                    "Inheritance Update",
-                    message
+        for (uint256 i = 0; i < will.beneficiaries.length; i++) {
+            try pushNotification.sendNotification(
+                address(0x123), // Channel address, replace with actual channel address
+                will.beneficiaries[i].beneficiaryAddress,
+                bytes(
+                    string(
+                        // We are passing identity here: https://comms.push.org/docs/notifications/notification-standards/notification-standards-advance/#notification-identity
+                        abi.encodePacked(
+                            "0", // this represents minimal identity,
+                            "+", // segregator
+                            "3", // define notification type: (1, 3 or 4) = (Broadcast, targeted or subset)
+                            "+", // segregator
+                            "Inheritance Update", // this is notification title
+                            "+", // segregator
+                            "Body" // notification body
+                        )
+                    )
                 )
-            {
-                emit NotificationSent(
-                    will.beneficiaries[i].beneficiaryAddress,
-                    message
-                );
+            ) {
+                emit NotificationSent(will.beneficiaries[i].beneficiaryAddress, message);
             } catch {
                 // Continue if notification fails
             }
@@ -574,9 +486,7 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
     }
 
     // Oracle integration
-    function updateDeathOracle(
-        address newOracle
-    ) external onlyRole(ADMIN_ROLE) {
+    function updateDeathOracle(address newOracle) external onlyRole(ADMIN_ROLE) {
         deathOracle = IDeathOracle(newOracle);
     }
 
