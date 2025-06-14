@@ -127,6 +127,256 @@ contract BequeathTest is Test {
         vm.stopPrank();
     }
 
+    function testDepositERC20() public {
+        _createBasicWill();
+
+        vm.startPrank(owner);
+
+        uint256 depositAmount = 500 ether;
+        token.approve(address(bequeath), depositAmount);
+        bequeath.depositERC20(address(token), depositAmount);
+
+        assertEq(bequeath.getERC20Balance(owner, address(token)), depositAmount);
+
+        Bequeath.Asset[] memory assets = bequeath.getAssets(owner);
+        assertEq(assets.length, 1);
+        assertEq(uint256(assets[0].assetType), uint256(Bequeath.AssetType.ERC20));
+        assertEq(assets[0].contractAddress, address(token));
+        assertEq(assets[0].amount, depositAmount);
+
+        vm.stopPrank();
+    }
+
+    function testDepositERC721() public {
+        _createBasicWill();
+
+        vm.startPrank(owner);
+
+        uint256 tokenId = 0;
+        nft.approve(address(bequeath), tokenId);
+        bequeath.depositERC721(address(nft), tokenId);
+
+        uint256[] memory holdings = bequeath.getERC721Holdings(owner, address(nft));
+        assertEq(holdings.length, 1);
+        assertEq(holdings[0], tokenId);
+
+        assertEq(nft.ownerOf(tokenId), address(bequeath));
+
+        vm.stopPrank();
+    }
+
+    function testDepositERC1155() public {
+        _createBasicWill();
+
+        vm.startPrank(owner);
+
+        uint256 tokenId = 1;
+        uint256 amount = 50;
+        multiToken.setApprovalForAll(address(bequeath), true);
+        bequeath.depositERC1155(address(multiToken), tokenId, amount);
+
+        assertEq(bequeath.getERC1155Balance(owner, address(multiToken), tokenId), amount);
+
+        vm.stopPrank();
+    }
+
+    function testWithdrawETH() public {
+        _createBasicWill();
+
+        vm.startPrank(owner);
+
+        uint256 depositAmount = 10 ether;
+        bequeath.depositETH{value: depositAmount}();
+
+        uint256 withdrawAmount = 5 ether;
+        uint256 balanceBefore = owner.balance;
+
+        bequeath.withdrawETH(withdrawAmount);
+
+        assertEq(owner.balance, balanceBefore + withdrawAmount);
+        assertEq(bequeath.getETHBalance(owner), depositAmount - withdrawAmount);
+
+        vm.stopPrank();
+    }
+
+    function testWithdrawERC20() public {
+        _createBasicWill();
+
+        vm.startPrank(owner);
+
+        uint256 depositAmount = 500 ether;
+        token.approve(address(bequeath), depositAmount);
+        bequeath.depositERC20(address(token), depositAmount);
+
+        uint256 withdrawAmount = 200 ether;
+        uint256 balanceBefore = token.balanceOf(owner);
+
+        bequeath.withdrawERC20(address(token), withdrawAmount);
+
+        assertEq(token.balanceOf(owner), balanceBefore + withdrawAmount);
+        assertEq(bequeath.getERC20Balance(owner, address(token)), depositAmount - withdrawAmount);
+
+        vm.stopPrank();
+    }
+
+    function testAnnounceInheritance() public {
+        _createBasicWill();
+        _depositTestAssets();
+
+        vm.startPrank(executor1);
+
+        bequeath.announceInheritance(owner);
+
+        Bequeath.InheritanceProcess memory process = bequeath.getInheritanceProcess(owner);
+        assertEq(process.initiator, executor1);
+        assertEq(uint256(process.status), uint256(Bequeath.ProcessStatus.Announced));
+        assertTrue(process.oracleVerified); // Should be true for non-oracle wills
+
+        vm.stopPrank();
+    }
+
+    function testAnnounceInheritanceWithOracle() public {
+        _createWillWithOracle();
+        _depositTestAssets();
+
+        // Set person as deceased in oracle
+        deathOracle.setDeceased(IDENTITY_HASH, true);
+
+        vm.startPrank(executor1);
+
+        bequeath.announceInheritance(owner);
+
+        Bequeath.InheritanceProcess memory process = bequeath.getInheritanceProcess(owner);
+        assertEq(process.initiator, executor1);
+        assertEq(uint256(process.status), uint256(Bequeath.ProcessStatus.Announced));
+        assertTrue(process.oracleVerified);
+
+        vm.stopPrank();
+    }
+
+    function testProvideConsensus() public {
+        _createBasicWill();
+        _depositTestAssets();
+
+        vm.prank(executor1);
+        bequeath.announceInheritance(owner);
+
+        vm.prank(executor1);
+        bequeath.provideConsensus(owner);
+
+        vm.prank(executor2);
+        bequeath.provideConsensus(owner);
+
+        Bequeath.InheritanceProcess memory process = bequeath.getInheritanceProcess(owner);
+        assertEq(process.executorConsensusCount, 2);
+    }
+
+    function testChallengeInheritance() public {
+        _createBasicWill();
+        _depositTestAssets();
+
+        vm.prank(executor1);
+        bequeath.announceInheritance(owner);
+
+        vm.prank(executor2);
+        bequeath.challengeInheritance(owner, "Suspicious circumstances");
+
+        Bequeath.InheritanceProcess memory process = bequeath.getInheritanceProcess(owner);
+        assertEq(uint256(process.status), uint256(Bequeath.ProcessStatus.Challenged));
+        assertEq(process.challengers.length, 1);
+        assertEq(process.challengers[0], executor2);
+    }
+
+    function testExecuteInheritance() public {
+        _createBasicWill();
+        _depositTestAssets();
+
+        // Announce inheritance
+        vm.prank(executor1);
+        bequeath.announceInheritance(owner);
+
+        // Provide consensus
+        vm.prank(executor1);
+        bequeath.provideConsensus(owner);
+        vm.prank(executor2);
+        bequeath.provideConsensus(owner);
+
+        // Skip moratorium and challenge period
+        vm.warp(block.timestamp + 7 days + 3 days + 1);
+
+        // Execute inheritance
+        vm.prank(executor1);
+        bequeath.executeInheritance(owner);
+
+        // Check that assets were distributed
+        assertEq(bequeath.getETHBalance(owner), 0);
+        assertEq(bequeath.getERC20Balance(owner, address(token)), 0);
+
+        // Check beneficiary balances (60% to beneficiary1, 40% to beneficiary2)
+        assertEq(beneficiary1.balance, 1 ether + 6 ether); // 1 ether initial + 6 ether from inheritance
+        assertEq(beneficiary2.balance, 1 ether + 4 ether); // 1 ether initial + 4 ether from inheritance
+
+        assertEq(token.balanceOf(beneficiary1), 300 ether); // 60% of 500
+        assertEq(token.balanceOf(beneficiary2), 200 ether); // 40% of 500
+    }
+
+    function testRevokeWill() public {
+        _createBasicWill();
+
+        vm.prank(owner);
+        bequeath.revokeWill();
+
+        Bequeath.Will memory will = bequeath.getWill(owner);
+        assertEq(uint256(will.status), uint256(Bequeath.WillStatus.Revoked));
+    }
+
+    function testCannotExecuteWithoutConsensus() public {
+        _createBasicWill();
+        _depositTestAssets();
+
+        vm.prank(executor1);
+        bequeath.announceInheritance(owner);
+
+        // Only one executor provides consensus (need minimum 2)
+        vm.prank(executor1);
+        bequeath.provideConsensus(owner);
+
+        vm.warp(block.timestamp + 7 days + 3 days + 1);
+
+        vm.expectRevert("Insufficient executor consensus");
+        vm.prank(executor1);
+        bequeath.executeInheritance(owner);
+    }
+
+    function testCannotExecuteBeforeMoratorium() public {
+        _createBasicWill();
+        _depositTestAssets();
+
+        vm.prank(executor1);
+        bequeath.announceInheritance(owner);
+
+        vm.prank(executor1);
+        bequeath.provideConsensus(owner);
+        vm.prank(executor2);
+        bequeath.provideConsensus(owner);
+
+        // Try to execute before moratorium period
+        vm.warp(block.timestamp + 3 days + 1); // Only challenge period passed
+
+        vm.expectRevert("Moratorium period not met");
+        vm.prank(executor1);
+        bequeath.executeInheritance(owner);
+    }
+
+    function testIsExecutor() public {
+        _createBasicWill();
+
+        assertTrue(bequeath.isExecutor(owner, executor1));
+        assertTrue(bequeath.isExecutor(owner, executor2));
+        assertFalse(bequeath.isExecutor(owner, beneficiary1));
+        assertFalse(bequeath.isExecutor(owner, nonParticipant));
+    }
+
     // ========== Helper Functions =============
     function _createBasicWill() internal {
         vm.startPrank(owner);

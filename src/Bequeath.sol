@@ -295,7 +295,8 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable, IERC721Receiver, 
         );
 
         ethBalances[msg.sender] -= amount;
-        payable(msg.sender).transfer(amount);
+        (bool success,) = payable(msg.sender).call{value: amount}("");
+        require(success, "Failed to send Ether");
 
         // Update asset registry
         _updateAssetAmount(AssetType.ETH, address(0), 0, ethBalances[msg.sender]);
