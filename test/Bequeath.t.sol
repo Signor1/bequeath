@@ -82,4 +82,116 @@ contract BequeathTest is Test {
 
         vm.stopPrank();
     }
+
+    function testCreateWillWithInvalidPercentages() public {
+        vm.startPrank(owner);
+
+        address[] memory executors = new address[](2);
+        executors[0] = executor1;
+        executors[1] = executor2;
+
+        Bequeath.Beneficiary[] memory beneficiaries = new Bequeath.Beneficiary[](2);
+        beneficiaries[0] = Bequeath.Beneficiary({
+            beneficiaryAddress: beneficiary1,
+            percentage: 5000, // 50%
+            description: "Primary beneficiary"
+        });
+        beneficiaries[1] = Bequeath.Beneficiary({
+            beneficiaryAddress: beneficiary2,
+            percentage: 3000, // 30% (total = 80%, should fail)
+            description: "Secondary beneficiary"
+        });
+
+        vm.expectRevert("Beneficiary percentages must sum to 100%");
+        bequeath.createWill(executors, beneficiaries, 7 days, IDENTITY_HASH, false);
+
+        vm.stopPrank();
+    }
+
+    function testDepositETH() public {
+        _createBasicWill();
+
+        vm.startPrank(owner);
+
+        uint256 depositAmount = 10 ether;
+        bequeath.depositETH{value: depositAmount}();
+
+        assertEq(bequeath.getETHBalance(owner), depositAmount);
+
+        Bequeath.Asset[] memory assets = bequeath.getAssets(owner);
+        assertEq(assets.length, 1);
+        assertEq(uint256(assets[0].assetType), uint256(Bequeath.AssetType.ETH));
+        assertEq(assets[0].amount, depositAmount);
+        assertTrue(assets[0].isDeposited);
+
+        vm.stopPrank();
+    }
+
+    // ========== Helper Functions =============
+    function _createBasicWill() internal {
+        vm.startPrank(owner);
+
+        address[] memory executors = new address[](2);
+        executors[0] = executor1;
+        executors[1] = executor2;
+
+        Bequeath.Beneficiary[] memory beneficiaries = new Bequeath.Beneficiary[](2);
+        beneficiaries[0] = Bequeath.Beneficiary({
+            beneficiaryAddress: beneficiary1,
+            percentage: 6000, // 60%
+            description: "Primary beneficiary"
+        });
+        beneficiaries[1] = Bequeath.Beneficiary({
+            beneficiaryAddress: beneficiary2,
+            percentage: 4000, // 40%
+            description: "Secondary beneficiary"
+        });
+
+        bequeath.createWill(executors, beneficiaries, 7 days, IDENTITY_HASH, false);
+
+        vm.stopPrank();
+    }
+
+    function _createWillWithOracle() internal {
+        vm.startPrank(owner);
+
+        address[] memory executors = new address[](2);
+        executors[0] = executor1;
+        executors[1] = executor2;
+
+        Bequeath.Beneficiary[] memory beneficiaries = new Bequeath.Beneficiary[](2);
+        beneficiaries[0] = Bequeath.Beneficiary({
+            beneficiaryAddress: beneficiary1,
+            percentage: 6000, // 60%
+            description: "Primary beneficiary"
+        });
+        beneficiaries[1] = Bequeath.Beneficiary({
+            beneficiaryAddress: beneficiary2,
+            percentage: 4000, // 40%
+            description: "Secondary beneficiary"
+        });
+
+        bequeath.createWill(
+            executors,
+            beneficiaries,
+            7 days,
+            IDENTITY_HASH,
+            true // Requires oracle verification
+        );
+
+        vm.stopPrank();
+    }
+
+    function _depositTestAssets() internal {
+        vm.startPrank(owner);
+
+        // Deposit ETH
+        bequeath.depositETH{value: 10 ether}();
+
+        // Deposit ERC20
+        token.approve(address(bequeath), 500 ether);
+        bequeath.depositERC20(address(token), 500 ether);
+
+        vm.stopPrank();
+    }
 }
