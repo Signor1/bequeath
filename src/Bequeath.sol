@@ -5,18 +5,25 @@ import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
+import "@openzeppelin/contracts/token/ERC1155/IERC1155Receiver.sol";
 import "@openzeppelin/contracts/interfaces/IERC165.sol";
 import {IDeathOracle} from "./interface/IDeathOracle.sol";
 import {IPUSHCommInterface} from "./interface/IPushNotification.sol";
 
 /**
- * @title Enhanced Bequeathable Asset Registry
+ * @title Enhanced Bequeathable Asset Registry With Custody
  * @dev Comprehensive inheritance system supporting multiple asset types and enhanced security
  * @author Enhanced from ERC-7878 proposal - https://eips.ethereum.org/EIPS/eip-7878
  */
-contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
+contract Bequeath is AccessControl, ReentrancyGuard, Pausable, IERC721Receiver, IERC1155Receiver {
+    // Use SafeERC20 for safe ERC20 operations
+    using SafeERC20 for IERC20;
+
+    // ============ Constants ================
     // Roles
     bytes32 public constant ORACLE_ROLE = keccak256("ORACLE_ROLE");
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
@@ -48,6 +55,7 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
         uint256 tokenId; // For ERC721/ERC1155
         uint256 amount; // For ERC20/ERC1155/ETH
         bytes additionalData;
+        bool isDeposited; // Indicates if the asset is held in custody
     }
 
     // Inheritance process structure
@@ -93,6 +101,12 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
     mapping(address => InheritanceProcess) public inheritanceProcesses;
     mapping(address => mapping(address => bool)) public executorConsensus;
 
+    // Asset custody tracking
+    mapping(address => uint256) public ethBalances; // Track ETH balance per user
+    mapping(address => mapping(address => uint256)) public erc20Balances; // user => token => balance
+    mapping(address => mapping(address => uint256[])) public erc721Holdings; // user => contract => tokenIds[]
+    mapping(address => mapping(address => mapping(uint256 => uint256))) public erc1155Balances; // user => contract => tokenId => amount
+
     // Death oracle and push notification interfaces
     IDeathOracle public deathOracle;
     IPUSHCommInterface public pushNotification;
@@ -106,7 +120,8 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
     // Events
     event WillCreated(address indexed owner, uint256 executorCount, uint256 beneficiaryCount);
     event WillUpdated(address indexed owner, uint256 timestamp);
-    event AssetRegistered(address indexed owner, AssetType assetType, address contractAddress);
+    event AssetDeposited(address indexed owner, AssetType assetType, address contractAddress, uint256 amount);
+    event AssetWithdrawn(address indexed owner, AssetType assetType, address contractAddress, uint256 amount);
     event InheritanceAnnounced(address indexed owner, address indexed initiator, uint256 challengeDeadline);
     event InheritanceChallenged(address indexed owner, address indexed challenger);
     event InheritanceExecuted(address indexed owner, uint256 totalBeneficiaries);
@@ -125,11 +140,21 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
         _;
     }
 
+    modifier onlyOwner(address owner) {
+        require(owner == msg.sender, "Only owner");
+        _;
+    }
+
     constructor(address _deathOracle, address _pushNotification) {
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(ADMIN_ROLE, msg.sender);
-        deathOracle = IDeathOracle(_deathOracle);
-        pushNotification = IPUSHCommInterface(_pushNotification);
+
+        if (_deathOracle != address(0)) {
+            deathOracle = IDeathOracle(_deathOracle);
+        }
+        if (_pushNotification != address(0)) {
+            pushNotification = IPUSHCommInterface(_pushNotification);
+        }
     }
 
     /**
@@ -198,32 +223,162 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
     }
 
     /**
-     * @dev Register an asset for inheritance
-     * @param _assetType Type of the asset (ETH, ERC20, ERC721, ERC1155)
-     * @param _contractAddress Address of the asset contract (if applicable)
-     * @param _tokenId Token ID for NFTs (0 for ETH/ERC20)
-     * @param _amount Amount of the asset (0 for NFTs)
-     * @param _additionalData Additional data for the asset (if needed)
+     * @dev Deposit ETH for inheritance
      */
-    function registerAsset(
+    function depositETH() external payable whenNotPaused {
+        require(wills[msg.sender].owner == msg.sender, "Must have active will");
+        require(msg.value > 0, "Must deposit ETH");
+
+        ethBalances[msg.sender] += msg.value;
+
+        // Register or update asset
+        _registerOrUpdateAsset(AssetType.ETH, address(0), 0, msg.value, "");
+
+        emit AssetDeposited(msg.sender, AssetType.ETH, address(0), msg.value);
+    }
+
+    /**
+     * @dev Deposit ERC20 tokens for inheritance
+     */
+    function depositERC20(address tokenContract, uint256 amount) external whenNotPaused {
+        require(wills[msg.sender].owner == msg.sender, "Must have active will");
+        require(amount > 0, "Amount must be > 0");
+
+        IERC20(tokenContract).safeTransferFrom(msg.sender, address(this), amount);
+        erc20Balances[msg.sender][tokenContract] += amount;
+
+        // Register or update asset
+        _registerOrUpdateAsset(AssetType.ERC20, tokenContract, 0, amount, "");
+
+        emit AssetDeposited(msg.sender, AssetType.ERC20, tokenContract, amount);
+    }
+
+    /**
+     * @dev Deposit ERC721 NFT for inheritance
+     */
+    function depositERC721(address nftContract, uint256 tokenId) external whenNotPaused {
+        require(wills[msg.sender].owner == msg.sender, "Must have active will");
+
+        IERC721(nftContract).safeTransferFrom(msg.sender, address(this), tokenId);
+        erc721Holdings[msg.sender][nftContract].push(tokenId);
+
+        // Register asset
+        _registerOrUpdateAsset(AssetType.ERC721, nftContract, tokenId, 1, "");
+
+        emit AssetDeposited(msg.sender, AssetType.ERC721, nftContract, 1);
+    }
+
+    /**
+     * @dev Deposit ERC1155 tokens for inheritance
+     */
+    function depositERC1155(address tokenContract, uint256 tokenId, uint256 amount) external whenNotPaused {
+        require(wills[msg.sender].owner == msg.sender, "Must have active will");
+        require(amount > 0, "Amount must be > 0");
+
+        IERC1155(tokenContract).safeTransferFrom(msg.sender, address(this), tokenId, amount, "");
+        erc1155Balances[msg.sender][tokenContract][tokenId] += amount;
+
+        // Register or update asset
+        _registerOrUpdateAsset(AssetType.ERC1155, tokenContract, tokenId, amount, "");
+
+        emit AssetDeposited(msg.sender, AssetType.ERC1155, tokenContract, amount);
+    }
+
+    /**
+     * @dev Withdraw ETH (only owner can withdraw their own assets)
+     */
+    function withdrawETH(uint256 amount) external nonReentrant onlyOwner(msg.sender) {
+        require(ethBalances[msg.sender] >= amount, "Insufficient balance");
+        require(
+            inheritanceProcesses[msg.sender].status == ProcessStatus.NotStarted,
+            "Cannot withdraw during inheritance process"
+        );
+
+        ethBalances[msg.sender] -= amount;
+        payable(msg.sender).transfer(amount);
+
+        // Update asset registry
+        _updateAssetAmount(AssetType.ETH, address(0), 0, ethBalances[msg.sender]);
+
+        emit AssetWithdrawn(msg.sender, AssetType.ETH, address(0), amount);
+    }
+
+    /**
+     * @dev Withdraw ERC20 tokens
+     */
+    function withdrawERC20(address tokenContract, uint256 amount) external nonReentrant onlyOwner(msg.sender) {
+        require(erc20Balances[msg.sender][tokenContract] >= amount, "Insufficient balance");
+        require(
+            inheritanceProcesses[msg.sender].status == ProcessStatus.NotStarted,
+            "Cannot withdraw during inheritance process"
+        );
+
+        erc20Balances[msg.sender][tokenContract] -= amount;
+        IERC20(tokenContract).safeTransfer(msg.sender, amount);
+
+        // Update asset registry
+        _updateAssetAmount(AssetType.ERC20, tokenContract, 0, erc20Balances[msg.sender][tokenContract]);
+
+        emit AssetWithdrawn(msg.sender, AssetType.ERC20, tokenContract, amount);
+    }
+
+    /**
+     * @dev Internal function to register or update asset
+     */
+    function _registerOrUpdateAsset(
         AssetType _assetType,
         address _contractAddress,
         uint256 _tokenId,
         uint256 _amount,
-        bytes calldata _additionalData
-    ) external whenNotPaused {
-        require(wills[msg.sender].owner == msg.sender, "Must have active will");
+        bytes memory _additionalData
+    ) internal {
+        Asset[] storage assets = registeredAssets[msg.sender];
 
+        // Check if asset already exists
+        for (uint256 i = 0; i < assets.length; i++) {
+            if (
+                assets[i].assetType == _assetType && assets[i].contractAddress == _contractAddress
+                    && assets[i].tokenId == _tokenId
+            ) {
+                assets[i].amount += _amount;
+                assets[i].isDeposited = true;
+                return;
+            }
+        }
+
+        // Add new asset
         Asset memory newAsset = Asset({
             assetType: _assetType,
             contractAddress: _contractAddress,
             tokenId: _tokenId,
             amount: _amount,
-            additionalData: _additionalData
+            additionalData: _additionalData,
+            isDeposited: true
         });
 
-        registeredAssets[msg.sender].push(newAsset);
-        emit AssetRegistered(msg.sender, _assetType, _contractAddress);
+        assets.push(newAsset);
+    }
+
+    /**
+     * @dev Internal function to update asset amount
+     */
+    function _updateAssetAmount(AssetType _assetType, address _contractAddress, uint256 _tokenId, uint256 _newAmount)
+        internal
+    {
+        Asset[] storage assets = registeredAssets[msg.sender];
+
+        for (uint256 i = 0; i < assets.length; i++) {
+            if (
+                assets[i].assetType == _assetType && assets[i].contractAddress == _contractAddress
+                    && assets[i].tokenId == _tokenId
+            ) {
+                assets[i].amount = _newAmount;
+                if (_newAmount == 0) {
+                    assets[i].isDeposited = false;
+                }
+                return;
+            }
+        }
     }
 
     /**
@@ -312,7 +467,7 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
         require(block.timestamp >= process.startTime + will.moratoriumPeriod, "Moratorium period not met");
         require(process.executorConsensusCount >= MIN_EXECUTOR_CONSENSUS, "Insufficient executor consensus");
 
-        if (will.requiresOracleVerification) {
+        if (will.requiresOracleVerification && address(deathOracle) != address(0)) {
             require(process.oracleVerified, "Oracle verification required");
         }
 
@@ -332,33 +487,68 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
      */
     function _transferAssets(address owner) internal {
         Will storage will = wills[owner];
-        Asset[] storage assets = registeredAssets[owner];
 
+        // Transfer ETH
+        if (ethBalances[owner] > 0) {
+            uint256 totalETH = ethBalances[owner];
+            for (uint256 j = 0; j < will.beneficiaries.length; j++) {
+                Beneficiary storage beneficiary = will.beneficiaries[j];
+                uint256 transferAmount = (totalETH * beneficiary.percentage) / 10000;
+                if (transferAmount > 0) {
+                    (bool success,) = payable(beneficiary.beneficiaryAddress).call{value: transferAmount}("");
+                    require(success, "Failed to send Ether");
+                }
+            }
+            ethBalances[owner] = 0;
+        }
+
+        // Transfer ERC20 tokens
+        Asset[] storage assets = registeredAssets[owner];
         for (uint256 i = 0; i < assets.length; i++) {
             Asset storage asset = assets[i];
 
-            for (uint256 j = 0; j < will.beneficiaries.length; j++) {
-                Beneficiary storage beneficiary = will.beneficiaries[j];
-                uint256 transferAmount = (asset.amount * beneficiary.percentage) / 10000;
+            if (!asset.isDeposited) continue;
 
-                if (transferAmount == 0) continue;
-
-                if (asset.assetType == AssetType.ETH) {
-                    payable(beneficiary.beneficiaryAddress).transfer(transferAmount);
-                } else if (asset.assetType == AssetType.ERC20) {
-                    IERC20(asset.contractAddress).transferFrom(owner, beneficiary.beneficiaryAddress, transferAmount);
-                } else if (asset.assetType == AssetType.ERC721) {
-                    // For NFTs, transfer to beneficiary with highest percentage for this asset
-                    if (j == 0) {
-                        // Transfer to first beneficiary for simplicity
-                        IERC721(asset.contractAddress).transferFrom(
-                            owner, beneficiary.beneficiaryAddress, asset.tokenId
-                        );
+            if (asset.assetType == AssetType.ERC20) {
+                uint256 totalAmount = erc20Balances[owner][asset.contractAddress];
+                if (totalAmount > 0) {
+                    for (uint256 j = 0; j < will.beneficiaries.length; j++) {
+                        Beneficiary storage beneficiary = will.beneficiaries[j];
+                        uint256 transferAmount = (totalAmount * beneficiary.percentage) / 10000;
+                        if (transferAmount > 0) {
+                            IERC20(asset.contractAddress).safeTransfer(beneficiary.beneficiaryAddress, transferAmount);
+                        }
                     }
-                } else if (asset.assetType == AssetType.ERC1155) {
-                    IERC1155(asset.contractAddress).safeTransferFrom(
-                        owner, beneficiary.beneficiaryAddress, asset.tokenId, transferAmount, ""
+                    erc20Balances[owner][asset.contractAddress] = 0;
+                }
+            } else if (asset.assetType == AssetType.ERC721) {
+                // Transfer NFTs to beneficiaries in order
+                uint256[] storage tokenIds = erc721Holdings[owner][asset.contractAddress];
+                uint256 beneficiaryIndex = 0;
+
+                for (uint256 k = 0; k < tokenIds.length; k++) {
+                    if (beneficiaryIndex >= will.beneficiaries.length) {
+                        beneficiaryIndex = 0; // Round robin distribution
+                    }
+                    IERC721(asset.contractAddress).safeTransferFrom(
+                        address(this), will.beneficiaries[beneficiaryIndex].beneficiaryAddress, tokenIds[k]
                     );
+                    beneficiaryIndex++;
+                }
+                delete erc721Holdings[owner][asset.contractAddress];
+            } else if (asset.assetType == AssetType.ERC1155) {
+                uint256 totalAmount = erc1155Balances[owner][asset.contractAddress][asset.tokenId];
+                if (totalAmount > 0) {
+                    for (uint256 j = 0; j < will.beneficiaries.length; j++) {
+                        Beneficiary storage beneficiary = will.beneficiaries[j];
+                        uint256 transferAmount = (totalAmount * beneficiary.percentage) / 10000;
+                        if (transferAmount > 0) {
+                            IERC1155(asset.contractAddress).safeTransferFrom(
+                                address(this), beneficiary.beneficiaryAddress, asset.tokenId, transferAmount, ""
+                            );
+                        }
+                    }
+                    erc1155Balances[owner][asset.contractAddress][asset.tokenId] = 0;
                 }
             }
         }
@@ -401,6 +591,22 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
 
     function getInheritanceProcess(address owner) external view returns (InheritanceProcess memory) {
         return inheritanceProcesses[owner];
+    }
+
+    function getETHBalance(address owner) external view returns (uint256) {
+        return ethBalances[owner];
+    }
+
+    function getERC20Balance(address owner, address token) external view returns (uint256) {
+        return erc20Balances[owner][token];
+    }
+
+    function getERC721Holdings(address owner, address nftContract) external view returns (uint256[] memory) {
+        return erc721Holdings[owner][nftContract];
+    }
+
+    function getERC1155Balance(address owner, address tokenContract, uint256 tokenId) external view returns (uint256) {
+        return erc1155Balances[owner][tokenContract][tokenId];
     }
 
     // ======= Helper Functions =========
@@ -490,6 +696,44 @@ contract Bequeath is AccessControl, ReentrancyGuard, Pausable {
         deathOracle = IDeathOracle(newOracle);
     }
 
+    // Required for receiving NFTs
+    function onERC721Received(address, address, uint256, bytes calldata) external pure override returns (bytes4) {
+        return IERC721Receiver.onERC721Received.selector;
+    }
+
+    function onERC1155Received(address, address, uint256, uint256, bytes calldata)
+        external
+        pure
+        override
+        returns (bytes4)
+    {
+        return IERC1155Receiver.onERC1155Received.selector;
+    }
+
+    function onERC1155BatchReceived(address, address, uint256[] calldata, uint256[] calldata, bytes calldata)
+        external
+        pure
+        override
+        returns (bytes4)
+    {
+        return IERC1155Receiver.onERC1155BatchReceived.selector;
+    }
+
+    function supportsInterface(bytes4 interfaceId)
+        public
+        view
+        virtual
+        override(AccessControl, IERC165)
+        returns (bool)
+    {
+        return interfaceId == type(IERC721Receiver).interfaceId || interfaceId == type(IERC1155Receiver).interfaceId
+            || super.supportsInterface(interfaceId);
+    }
+
     // Fallback to receive ETH
-    receive() external payable {}
+    receive() external payable {
+        // ETH sent directly to contract is not attributed to any user
+        // Users must use depositETH() function
+        revert("Use depositETH() function");
+    }
 }
